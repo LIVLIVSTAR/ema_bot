@@ -148,6 +148,24 @@ def will_reset_touch(prev_anchor: float | None, price: float, ema_now: float, re
 async def run():
     spot_symbols = build_spot_universe()
     print(f"Spot symbols: {len(spot_symbols)}")
+import os, requests
+
+# Получаем токен и chat_id из окружения Railway
+bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+
+# Отправляем сообщение в Telegram при запуске
+if bot_token and chat_id:
+    try:
+        msg = f"Бот запущен ✅ Кол-во символов: {len(spot_symbols)}"
+        requests.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            data={"chat_id": chat_id, "text": msg}
+        )
+    except Exception as e:
+        print("Ошибка отправки сообщения при старте:", e)
+else:
+    print("Нет TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID в окружении")
 
     # состояния загружаем лениво при первом тике символа
     states: dict[str, SymState] = {}
@@ -234,3 +252,4 @@ if __name__ == "__main__":
         print("Please set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env")
         raise SystemExit(1)
     asyncio.run(run())
+
