@@ -1,255 +1,94 @@
-import os, asyncio, json, math, time, datetime as dt
-from collections import deque, defaultdict
-
-import pandas as pd
+import os
+import asyncio
+import time
 import requests
+import json
+import math
+from datetime import datetime
+
 import websockets
-from dotenv import load_dotenv
+import pandas as pd
 
-load_dotenv()
+# === Параметры из Railway .env ===
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-TG_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
-TG_CHATID = os.getenv("TELEGRAM_CHAT_ID")
-TOUCH_EPS = float(os.getenv("TOUCH_EPS", "0.001"))   # 0.1%
-RESET_EPS = float(os.getenv("RESET_EPS", "0.003"))   # 0.3%
+# пары из переменной окружения PAIRS через запятую (например: BTCUSDT,BNBUSDT)
+PAIRS_ENV = os.getenv("PAIRS", "")
+PAIRS = [p.strip().lower() for p in PAIRS_ENV.split(",") if p.strip()]
 
-BINANCE_API = "https://api.binance.com"
-WS_MINITICK = "wss://stream.binance.com:9443/ws/!miniTicker@arr"  # все спотовые минитикеры
+TOUCH_EMA50 = {}
+TOUCH_EMA200 = {}
 
-ALPHA200 = 2/(200+1)
+last_sent_hour = None
 
-# ---------- Telegram ----------
-def tg_send(text: str):
+# === Функция отправки сообщения в Telegram ===
+def send_message(text: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
     try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                      json={"chat_id": TG_CHATID, "text": text, "disable_web_page_preview": True})
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        print("Telegram error:", e)
+        print("Ошибка отправки Telegram:", e)
 
-# ---------- Binance REST ----------
-def get_exchange_info():
-    r = requests.get(BINANCE_API + "/api/v3/exchangeInfo", timeout=20)
-    r.raise_for_status()
-    return r.json()
+# === Получение данных по свечам Binance ===
+def get_klines(symbol: str, interval='1m', limit=250):
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval={interval}&limit={limit}"
+    data = requests.get(url, timeout=10).json()
+    df = pd.DataFrame(data, columns=[
+        'time','o','h','l','c','v','close_time','q','n','taker_base','taker_quote','ignore'
+    ])
+    df['c'] = df['c'].astype(float)
+    return df
 
-def fetch_1d_klines(symbol: str, limit=210):
-    params = {"symbol": symbol, "interval": "1d", "limit": limit}
-    r = requests.get(BINANCE_API + "/api/v3/klines", params=params, timeout=20)
-    r.raise_for_status()
-    return r.json()
+# === Проверка касания EMA ===
+def check_touch(symbol: str):
+    df = get_klines(symbol, interval='1m', limit=250)
+    closes = df['c']
+    ema50 = closes.ewm(span=50).mean().iloc[-1]
+    ema200 = closes.ewm(span=200).mean().iloc[-1]
+    price = closes.iloc[-1]
 
-def calc_ema200_prev(closes: pd.Series) -> float:
-    """
-    Возвращает EMA200 на ЗАКРЫТОЙ вчерашней свече.
-    Для intraday будем проектировать текущую EMA как: ema_today = ema_prev*(1-α) + price*α
-    """
-    ema = closes.ewm(span=200, adjust=False).mean()
-    # ema.iloc[-2] — вчерашняя EMA200 (последняя закрытая свеча)
-    return float(ema.iloc[-2])
+    touched_50 = math.isclose(price, ema50, rel_tol=0.0005) or (price >= ema50 and closes.iloc[-2] < ema50) or (price <= ema50 and closes.iloc[-2] > ema50)
+    touched_200 = math.isclose(price, ema200, rel_tol=0.0005) or (price >= ema200 and closes.iloc[-2] < ema200) or (price <= ema200 and closes.iloc[-2] > ema200)
 
-# ---------- Вселенная спотовых символов ----------
-def build_spot_universe():
-    info = get_exchange_info()
-    spot = set()
-    for s in info["symbols"]:
-        if s.get("status") != "TRADING":
-            continue
-        perms = s.get("permissions", [])
-        if "SPOT" not in perms:
-            continue
-        sym = s["symbol"]
-        # Можно исключить токены типа UP/DOWN, если не нужны:
-        if sym.endswith("UPUSDT") or sym.endswith("DOWNUSDT"):
-            pass  # оставляем, ты сказал "все пары" — не фильтрую. Хочешь — раскомментируй ниже.
-            # continue
-        spot.add(sym)
-    return spot
+    return price, ema50, ema200, touched_50, touched_200
 
-# ---------- Состояние по символам ----------
-class SymState:
-    __slots__ = ("ema_prev200", "last_side", "in_touch", "last_reset_anchor", "last_refresh_date", "yesterday_close")
-    def __init__(self, ema_prev200: float, yesterday_close: float, last_refresh_date: dt.date):
-        self.ema_prev200 = ema_prev200        # вчерашняя EMA200
-        self.yesterday_close = yesterday_close
-        self.last_side = None                 # 'above' | 'below' | 'touch'
-        self.in_touch = False                 # находимся в зоне touch
-        self.last_reset_anchor = None         # цена, от которой вышли из зоны touch
-        self.last_refresh_date = last_refresh_date  # когда последний раз пересчитывали ema_prev
-
-def fmt_pair(binance_symbol: str) -> str:
-    # Разделяем BASE/QUOTE по известным котировочным валютам
-    quotes = ["USDT","USDC","FDUSD","BUSD","BTC","ETH","BNB","TRY","EUR","TUSD","PYUSD","SOL"]
-    for q in quotes:
-        if binance_symbol.endswith(q):
-            base = binance_symbol[:-len(q)]
-            return f"{base}/{q}"
-    # fallback
-    return binance_symbol
-
-def classify_side(price: float, ema_now: float, eps: float):
-    d = (price - ema_now) / ema_now
-    if abs(d) <= eps:
-        return "touch"
-    return "above" if d > eps else "below"
-
-async def prepare_symbol_state(symbol: str) -> SymState | None:
-    try:
-        kl = fetch_1d_klines(symbol, limit=210)
-        if len(kl) < 201:
-            return None
-        closes = pd.Series([float(x[4]) for x in kl], dtype=float)
-        ema_prev = calc_ema200_prev(closes)
-        yclose = float(kl[-2][4])  # вчерашний close
-        last_day = dt.datetime.utcfromtimestamp(kl[-1][0]/1000).date()  # дата текущей (незакрытой) свечи
-        return SymState(ema_prev200=ema_prev, yesterday_close=yclose, last_refresh_date=last_day)
-    except Exception as e:
-        print("prepare_symbol_state error", symbol, e)
-        return None
-
-async def refresh_symbol_state(symbol: str, state: SymState) -> None:
-    """ Ежедневное обновление: пересчитать вчерашнюю EMA200 после закрытия дня """
-    try:
-        kl = fetch_1d_klines(symbol, limit=210)
-        if len(kl) < 201:
-            return
-        closes = pd.Series([float(x[4]) for x in kl], dtype=float)
-        state.ema_prev200 = calc_ema200_prev(closes)
-        state.yesterday_close = float(kl[-2][4])
-        state.last_refresh_date = dt.datetime.utcfromtimestamp(kl[-1][0]/1000).date()
-    except Exception as e:
-        print("refresh_symbol_state error", symbol, e)
-
-async def daily_refresher(states: dict, throttle_per_minute=40):
-    """Раз в 15 минут проходит по символам, которые не обновлялись сегодня, и освежает EMA_prev200."""
+# === Главная асинхронная петля ===
+async def main_loop():
+    global last_sent_hour
     while True:
-        try:
-            today = dt.datetime.utcnow().date()
-            cnt = 0
-            for sym, st in list(states.items()):
-                if st.last_refresh_date != today and cnt < throttle_per_minute:
-                    await refresh_symbol_state(sym, st)
-                    cnt += 1
-            # печатаем для контроля
-            if cnt:
-                print(f"[daily_refresher] refreshed {cnt} symbols")
-        except Exception as e:
-            print("daily_refresher error:", e)
-        await asyncio.sleep(900)  # 15 минут
+        now = datetime.utcnow()
+        current_hour = now.strftime("%Y-%m-%d %H")  # например 2025-09-16 17
+        messages = []
 
-def event_text(symbol: str, price: float, action: str) -> str:
-    # формат: "pair name, price, action"
-    return f"{fmt_pair(symbol)}, {price}, {action}"
+        for symbol in PAIRS:
+            try:
+                price, ema50, ema200, touched_50, touched_200 = check_touch(symbol)
+                text_part = ""
+                if touched_50:
+                    text_part += f"{symbol.upper()} touched EMA50 at {price:.4f}\n"
+                if touched_200:
+                    text_part += f"{symbol.upper()} touched EMA200 at {price:.4f}\n"
+                if text_part:
+                    messages.append(text_part)
+            except Exception as e:
+                print("Ошибка по паре", symbol, e)
 
-def will_reset_touch(prev_anchor: float | None, price: float, ema_now: float, reset_eps: float) -> bool:
-    """Вернулись ли мы достаточно далеко от EMA, чтобы новый 'touch' считался новым событием?"""
-    d = abs((price - ema_now)/ema_now)
-    return d >= reset_eps
+        if messages:
+            text = "\n".join(messages) + "\nSponsored by www.livlivstar.com"
+        else:
+            text = "/Just Relax/ Sponsored by www.livlivstar.com"
 
-async def run():
-    spot_symbols = build_spot_universe()
-    print(f"Spot symbols: {len(spot_symbols)}")
-import os, requests
+        send_message(text)
 
-# Получаем токен и chat_id из окружения Railway
-bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
-chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+        # ждём до следующего часа
+        # вычисляем сколько секунд осталось до начала следующего часа
+        now = datetime.utcnow()
+        wait_sec = 3600 - (now.minute*60 + now.second)
+        await asyncio.sleep(wait_sec)
 
-# Отправляем сообщение в Telegram при запуске
-if bot_token and chat_id:
-    try:
-        msg = f"Бот запущен ✅ Кол-во символов: {len(spot_symbols)}"
-        requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            data={"chat_id": chat_id, "text": msg}
-        )
-    except Exception as e:
-        print("Ошибка отправки сообщения при старте:", e)
-else:
-    print("Нет TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID в окружении")
-
-    # состояния загружаем лениво при первом тике символа
-    states: dict[str, SymState] = {}
-    # запускаем ежедневный освежатель
-    asyncio.create_task(daily_refresher(states))
-
-    # подключаемся к минитикерам
-    while True:
-        try:
-            async with websockets.connect(WS_MINITICK, ping_interval=20, ping_timeout=20) as ws:
-                print("WS connected")
-                async for raw in ws:
-                    try:
-                        arr = json.loads(raw)
-                        # формат: список минитикеров
-                        now = dt.datetime.utcnow()
-                        today = now.date()
-
-                        for item in arr:
-                            sym = item.get("s")
-                            if sym not in spot_symbols:
-                                continue
-                            price = float(item.get("c"))  # last price
-
-                            st = states.get(sym)
-                            if st is None:
-                                # Ленивая инициализация (бережём лимиты)
-                                st = await prepare_symbol_state(sym)
-                                if st is None:
-                                    continue
-                                states[sym] = st
-
-                            # если день сменился — пусть фоновой таск освежит; здесь просто не мешаем
-                            # проецируем текущую EMA200 на основе сегодняшней цены
-                            ema_now = st.ema_prev200*(1-ALPHA200) + price*ALPHA200
-
-                            # определяем сторону
-                            side = classify_side(price, ema_now, TOUCH_EPS)
-
-                            # TOUCH логика
-                            if side == "touch":
-                                if st.last_side == "above":
-                                    if not st.in_touch:  # первый вход в зону
-                                        tg_send(event_text(sym, price, "touch from above"))
-                                        st.in_touch = True
-                                        st.last_reset_anchor = price
-                                elif st.last_side == "below":
-                                    if not st.in_touch:
-                                        tg_send(event_text(sym, price, "touch from below"))
-                                        st.in_touch = True
-                                        st.last_reset_anchor = price
-                                else:
-                                    # были touch → повторим только если вышли из зоны достаточно далеко и снова вернулись
-                                    pass
-
-                            # CROSS логика
-                            if st.last_side == "above" and side == "below":
-                                tg_send(event_text(sym, price, "cross to down"))
-                                st.in_touch = False
-                                st.last_reset_anchor = price
-
-                            if st.last_side == "below" and side == "above":
-                                tg_send(event_text(sym, price, "cross to up"))
-                                st.in_touch = False
-                                st.last_reset_anchor = price
-
-                            # Обновляем last_side и touch-reset
-                            # если вышли далеко от EMA — разрешаем следующий touch
-                            if side != "touch":
-                                if st.in_touch and will_reset_touch(st.last_reset_anchor, price, ema_now, RESET_EPS):
-                                    st.in_touch = False
-                                    st.last_reset_anchor = price
-
-                            st.last_side = side
-
-                    except Exception as e:
-                        print("loop item error:", e)
-        except Exception as e:
-            print("WS reconnect in 5s, reason:", e)
-            await asyncio.sleep(5)
-
+# === Запуск ===
 if __name__ == "__main__":
-    if not TG_TOKEN or not TG_CHATID:
-        print("Please set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env")
-        raise SystemExit(1)
-    asyncio.run(run())
-
+    print("Bot started...")
+    asyncio.run(main_loop())
