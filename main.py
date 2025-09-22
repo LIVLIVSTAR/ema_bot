@@ -6,9 +6,17 @@ import pandas as pd
 TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 TELEGRAM_CHAT_ID   = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 PAIRS_ENV          = os.getenv("PAIRS", "BTCUSDT,ETHUSDT").strip()
-TIMEFRAME          = os.getenv("TIMEFRAME", "1d").strip()  # ← по умолчанию дневной TF
 INTERVAL_MINUTES   = int(os.getenv("INTERVAL_MINUTES", "60"))
 SEND_RELAX         = os.getenv("SEND_RELAX_IF_NO_TOUCHES", "1").lower() in ("1","true","yes")
+CHUNK_SIZE         = int(os.getenv("CHUNK_SIZE", "28"))  # ~28 lines per message to keep under 4096 chars
+
+# Fixed monitors per your request:
+# (interval, ema_span, label)
+MONITORS = [
+    ("1d", 200, "ema200"),
+    ("1w",  50, "ema50"),
+    ("1w", 200, "ema200"),
+]
 
 def parse_pairs(raw: str):
     seps = [",",";"," "]
@@ -25,11 +33,14 @@ def parse_pairs(raw: str):
 PAIRS = parse_pairs(PAIRS_ENV)
 
 def tg_send(text: str) -> bool:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return False
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram config missing")
+        return False
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=20
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            timeout=20
         )
         if r.status_code != 200:
             print(f"Telegram send failed [{r.status_code}]: {r.text}")
@@ -39,13 +50,13 @@ def tg_send(text: str) -> bool:
         print("Telegram exception:", repr(e))
         return False
 
-def get_klines(symbol: str, interval: str, limit: int = 250):
+def get_klines(symbol: str, interval: str, limit: int):
     url = "https://api.binance.com/api/v3/klines"
     try:
         r = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=20)
         data = r.json()
         if not isinstance(data, list):
-            print(f"Binance error for {symbol}: {data}")
+            print(f"Binance error for {symbol} [{interval}]: {data}")
             return None
         df = pd.DataFrame(data, columns=[
             'time','o','h','l','c','v','close_time','q','n','taker_base','taker_quote','ignore'
@@ -53,55 +64,62 @@ def get_klines(symbol: str, interval: str, limit: int = 250):
         df['c'] = df['c'].astype(float)
         return df
     except Exception as e:
-        print(f"Klines exception for {symbol}:", repr(e))
+        print(f"Klines exception for {symbol} [{interval}]:", repr(e))
         return None
 
-def check_touch(symbol: str):
-    df = get_klines(symbol, TIMEFRAME, limit=250)  # ← используем дневные 1d (или что в .env)
-    if df is None or len(df) < 210:
+def ema_touch_for(symbol: str, interval: str, span: int, rel_tol=0.0005):
+    """Return ('touched', price) if last close touches/crosses EMA(span) on the given interval."""
+    # enough history: 210 for ema200 is safe; weekly needs fewer requests but keep generous
+    limit = 260 if interval in ("1w", "1d") else 250
+    df = get_klines(symbol, interval, limit=limit)
+    if df is None or len(df) < span + 5:
         return None
 
     closes = df['c']
-    ema50  = closes.ewm(span=50, adjust=False).mean().iloc[-1]
-    ema200 = closes.ewm(span=200, adjust=False).mean().iloc[-1]
+    ema    = closes.ewm(span=span, adjust=False).mean().iloc[-1]
     price  = closes.iloc[-1]
     prev   = closes.iloc[-2]
 
-    touched_50  = math.isclose(price, ema50, rel_tol=0.0005) or (price >= ema50 and prev < ema50) or (price <= ema50 and prev > ema50)
-    touched_200 = math.isclose(price, ema200, rel_tol=0.0005) or (price >= ema200 and prev < ema200) or (price <= ema200 and prev > ema200)
-
-    res = []
-    if touched_50:
-        res.append((symbol, price, "ema50"))
-    if touched_200:
-        res.append((symbol, price, "ema200"))
-    return res
+    touched = (
+        math.isclose(price, ema, rel_tol=rel_tol) or
+        (price >= ema and prev < ema) or
+        (price <= ema and prev > ema)
+    )
+    if touched:
+        return price
+    return None
 
 def one_report():
     lines = []
     for sym in PAIRS:
-        try:
-            hits = check_touch(sym)
-            if not hits: continue
-            for (symbol, price, which) in hits:
-                lines.append(f"{symbol}, price {price:.6f}, {which} [{TIMEFRAME}]")
-        except Exception as e:
-            print(f"check_touch exception for {sym}:", repr(e))
+        for (interval, span, label) in MONITORS:
+            try:
+                pr = ema_touch_for(sym, interval, span)
+                if pr is not None:
+                    lines.append(f"{sym}, price {pr:.6f}, {label} [{interval}]")
+            except Exception as e:
+                print(f"touch check error {sym} {interval} {span}:", repr(e))
 
     if lines:
+        # split into chunks to avoid Telegram 4096-char limit
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        msg = f"EMA touches report ({ts})\n" + "\n".join(lines) + "\nSponsored by www.livlivstar.com"
-        tg_send(msg)
+        for i in range(0, len(lines), CHUNK_SIZE):
+            part = "\n".join(lines[i:i+CHUNK_SIZE])
+            msg = f"EMA touches report ({ts})\n{part}\nSponsored by www.livlivstar.com"
+            tg_send(msg)
     else:
         if SEND_RELAX:
             tg_send("Just Relax / Sponsored by www.livlivstar.com")
 
 def main():
-    print(f"Bot started… Pairs={PAIRS} interval={INTERVAL_MINUTES}m timeframe={TIMEFRAME} send_relax={SEND_RELAX}")
+    print(f"Bot started… pairs={len(PAIRS)} interval={INTERVAL_MINUTES}m monitors={MONITORS} relax={SEND_RELAX}")
     tg_send("ema_bot is online ✅ (startup ping)")
-    period = INTERVAL_MINUTES * 60
+    period = max(60, INTERVAL_MINUTES * 60)  # at least 60s
     t0 = time.monotonic()
-    one_report()  # первый отчёт сразу
+
+    # first report immediately
+    one_report()
+
     while True:
         now = time.monotonic()
         remaining = period - ((now - t0) % period)
